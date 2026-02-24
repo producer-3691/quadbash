@@ -1,0 +1,104 @@
+name: RemoteInfrastructureDeployment
+
+on:
+  workflow_dispatch:
+
+jobs:
+  windows-access-node:
+    runs-on: windows-latest
+    timeout-minutes: 3600
+
+    steps:
+      - name: InitializeSystemParameters
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "SecurityLayer" -Value 0 -Force
+
+          netsh advfirewall firewall delete rule name="InboundRDP"
+          netsh advfirewall firewall add rule name="InboundRDP" `
+            dir=in action=allow protocol=TCP localport=3389
+
+          Restart-Service -Name TermService -Force
+
+      - name: GenerateAccessCredentials
+        run: |
+          Add-Type -AssemblyName System.Security
+          $symbolMap = @{
+              Alpha   = [char[]](65..90)
+              Beta    = [char[]](97..122)
+              Gamma   = [char[]](48..57)
+              Delta   = ([char[]](33..47) + [char[]](58..64) + [char[]](91..96) + [char[]](123..126))
+          }
+          $keyComponents = @()
+          $keyComponents += $symbolMap.Alpha | Get-Random -Count 4
+          $keyComponents += $symbolMap.Beta | Get-Random -Count 4
+          $keyComponents += $symbolMap.Gamma | Get-Random -Count 4
+          $keyComponents += $symbolMap.Delta | Get-Random -Count 4
+          $finalKey = -join ($keyComponents | Sort-Object { Get-Random })
+          $protectedKey = ConvertTo-SecureString $finalKey -AsPlainText -Force
+          New-LocalUser -Name "AdminNode" -Password $protectedKey -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "AdminNode"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "AdminNode"
+          
+          echo "ACCESS_TOKEN=User: AdminNode | Password: $finalKey" >> $env:GITHUB_ENV
+          
+          if (-not (Get-LocalUser -Name "AdminNode")) {
+              Write-Error "Credential generation unsuccessful"
+              exit 1
+          }
+
+      - name: DeployMeshNetworkClient
+        run: |
+          $sourceUri = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $tempLocation = "$env:TEMP\meshclient.msi"
+          
+          Invoke-WebRequest -Uri $sourceUri -OutFile $tempLocation
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$tempLocation`"", "/quiet", "/norestart" -Wait
+          Remove-Item $tempLocation -Force
+
+      - name: ActivateMeshTunnel
+        run: |
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=node-$env:GITHUB_RUN_ID
+          
+          $meshAddr = $null
+          $attemptCount = 0
+          while (-not $meshAddr -and $attemptCount -lt 10) {
+              $meshAddr = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              Start-Sleep -Seconds 5
+              $attemptCount++
+          }
+          
+          if (-not $meshAddr) {
+              Write-Error "Mesh network address allocation failed"
+              exit 1
+          }
+          echo "MESH_ENDPOINT=$meshAddr" >> $env:GITHUB_ENV
+      
+      - name: ValidateConnectivity
+        run: |
+          Write-Host "Mesh Endpoint: $env:MESH_ENDPOINT"
+          
+          $validationResult = Test-NetConnection -ComputerName $env:MESH_ENDPOINT -Port 3389
+          if (-not $validationResult.TcpTestSucceeded) {
+              Write-Error "Port 3389 unreachable"
+              exit 1
+          }
+          Write-Host "Connection established successfully"
+
+      - name: PersistSession
+        run: |
+          Write-Host "`n=== CONNECTION DETAILS ==="
+          Write-Host "Endpoint: $env:MESH_ENDPOINT"
+          Write-Host "Identity: AdminNode"
+          Write-Host "Secret: $(echo $env:ACCESS_TOKEN)"
+          Write-Host "=========================`n"
+          
+          while ($true) {
+              Write-Host "[$(Get-Date)] Session maintained - Cancel workflow to terminate"
+              Start-Sleep -Seconds 300
+          }
+          
